@@ -1,4 +1,4 @@
-name: Terraform Deploy + Ansible Configuration
+name: Terraform + Ansible Basic Setup
 
 on:
   workflow_dispatch:
@@ -16,54 +16,43 @@ on:
 env:
   AWS_REGION: "ap-northeast-2"
   TF_STATE_BUCKET: "your-terraform-state-bucket"
-  ANSIBLE_SSH_KEY_PATH: "./keys/ec2_key.pem"  # EC2 접속용 SSH 키 경로
+  ANSIBLE_SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}  # 저장소 Secrets에 등록된 SSH 키
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: "1.6.6"
-
-      - name: Terraform Init
-        run: terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" -backend-config="key=${{ github.event.inputs.env }}/terraform.tfstate"
-
       - name: Terraform Apply
-        run: terraform apply -var="env=${{ github.event.inputs.env }}" -var="key_name=CH3-key" -auto-approve
+        run: |
+          terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET}}"
+          terraform apply -auto-approve -var="env=${{ github.event.inputs.env }}"
 
       - name: Get EC2 Public IP
         id: get_ip
         run: |
           IP=$(terraform output -raw ec2_public_ip | tr -d '"')
           echo "EC2_PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
-          echo "::set-output name=EC2_PUBLIC_IP::$IP"
 
       - name: Wait for SSH
         run: |
           for i in {1..30}; do
             if nc -z -w 5 ${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} 22; then
-              echo "SSH available!"
+              echo "SSH 연결 성공"
               exit 0
             fi
             sleep 10
           done
-          echo "SSH timeout"
+          echo "::error::SSH 연결 실패"
           exit 1
 
       - name: Setup Ansible
@@ -71,71 +60,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ansible
 
-      - name: Create Ansible Inventory
+      - name: Create SSH Key File
         run: |
-          mkdir -p ansible
-          cat <<EOF > ansible/inventory.ini
-          [jumpbox]
-          ${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} ansible_user=ubuntu ansible_ssh_private_key_file=${{ env.ANSIBLE_SSH_KEY_PATH }}
+          mkdir -p ~/.ssh
+          echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
 
-          [backup_targets]  # 향후 확장을 위한 그룹
-          # 다른 백업 대상 서버들을 여기에 추가
+      - name: Generate Ansible Inventory
+        run: |
+          cat <<EOF > inventory.ini
+          [ec2_instances]
+          target_server ansible_host=${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} ansible_user=ubuntu
+            ansible_ssh_private_key_file=~/.ssh/ec2_key
+            ansible_python_interpreter=/usr/bin/python3
+
+          [all:vars]
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
           EOF
 
-      - name: Run Jumpbox Setup Playbook
+      - name: Run Basic Playbook
         run: |
-          cat <<EOF > ansible/jumpbox_setup.yml
+          cat <<EOF > playbook.yml
           ---
-          - name: Configure Jumpbox EC2
-            hosts: jumpbox
-            become: true
+          - name: Basic EC2 Configuration
+            hosts: ec2_instances
+            become: yes
             tasks:
-              - name: Install essential packages
+              - name: Install basic packages
                 apt:
-                  name:
-                    - ansible
-                    - awscli
-                    - python3-boto3
+                  name: ["vim", "curl", "git", "unzip"]
+                  state: present
+                  update_cache: yes
+
+              - name: Ensure Python3 is installed
+                apt:
+                  name: python3
                   state: present
 
-              - name: Configure AWS CLI
-                shell: |
-                  aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
-                  aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-                  aws configure set region ${{ env.AWS_REGION }}
-                args:
-                  executable: /bin/bash
-
-              - name: Create backup script directory
+              - name: Create setup marker file
                 file:
-                  path: /opt/backup_scripts
-                  state: directory
-                  mode: '0755'
-
-              - name: Copy backup scripts
-                copy:
-                  src: "{{ playbook_dir }}/files/backup_script.sh"
-                  dest: /opt/backup_scripts/
-                  mode: '0755'
+                  path: /tmp/ansible_setup_complete
+                  state: touch
           EOF
 
-          ansible-playbook -i ansible/inventory.ini ansible/jumpbox_setup.yml
-
-      - name: Deploy Backup Automation
-        run: |
-          cat <<EOF > ansible/backup_automation.yml
-          ---
-          - name: Setup Backup Cron Job
-            hosts: jumpbox
-            become: true
-            tasks:
-              - name: Add daily backup cron job
-                cron:
-                  name: "Daily S3 Backup"
-                  minute: "0"
-                  hour: "2"
-                  job: "/opt/backup_scripts/backup_script.sh"
-                  user: ubuntu
-          EOF
-
-          ansible-playbook -i ansible/inventory.ini ansible/backup_automation.yml
+          ansible-playbook -i inventory.ini playbook.yml

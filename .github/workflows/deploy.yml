@@ -1,4 +1,4 @@
-name: Terraform + Ansible All-in-One
+name: Terraform + Ansible Deployment
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ env:
   AWS_REGION: "ap-northeast-2"
   TF_STATE_BUCKET: "your-terraform-state-bucket"
   KEY_NAME: "CH3-key"
-  ANSIBLE_SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}  # SSH 키 통일
+  ANSIBLE_SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
 
 jobs:
   deploy:
@@ -46,12 +46,14 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       # === 4. SSH 키 설정 ===
-      - name: Create SSH Key File
+      - name: Setup SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/CH3-key.pem
           chmod 600 ~/.ssh/CH3-key.pem
           ssh-keygen -y -f ~/.ssh/CH3-key.pem > ~/.ssh/CH3-key.pub
+          echo "키 생성 완료. Fingerprint:"
+          ssh-keygen -lf ~/.ssh/CH3-key.pem
 
       # === 5. Terraform 초기화 ===
       - name: Terraform Init
@@ -60,64 +62,75 @@ jobs:
             -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
             -backend-config="key=${{ github.event.inputs.env }}/terraform.tfstate"
 
-      # === 6. Terraform 적용 ===
+      # === 6. 인스턴스 생성 ===
       - name: Terraform Apply
         run: |
           terraform apply -auto-approve \
             -var="env=${{ github.event.inputs.env }}" \
             -var="key_name=${{ env.KEY_NAME }}"
 
-      # === 7. EC2 IP 획득 ===
+      # === 7. 인스턴스 상태 확인 ===
+      - name: Wait for Instance Ready
+        run: |
+          aws ec2 wait instance-status-ok \
+            --instance-ids $(terraform output -raw ec2_instance_id) \
+            --region ${{ env.AWS_REGION }}
+
+      # === 8. IP 주소 획득 ===
       - name: Get EC2 Public IP
         id: get_ip
         run: |
-          IP=$(terraform output -raw ec2_public_ip | sed 's/"//g' | tr -d '\n\r')
-          if [ -z "$IP" ]; then
-            echo "::error::EC2 Public IP를 가져오지 못했습니다"
+          IP=$(terraform output -raw ec2_public_ip | tr -d '"' | tr -d '\n')
+          if [[ ! "$IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "::error::유효하지 않은 IP 주소 형식: $IP"
             exit 1
           fi
           echo "EC2_PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
-          echo "확인된 EC2 Public IP: $IP"  # 디버깅용 출력
+          echo "확인된 IP: $IP"
 
-      # === 8. SSH 연결 대기 ===
-      - name: Wait for SSH
+      # === 9. SSH 연결 테스트 ===
+      - name: Test SSH Connection
+        timeout-minutes: 5
         run: |
-          for i in {1..30}; do
-            if nc -z -w 5 ${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} 22; then
-              echo "SSH 연결 성공"
+          for i in {1..20}; do
+            echo "SSH 연결 시도 ($i/20)..."
+            if ssh -o ConnectTimeout=10 \
+              -o StrictHostKeyChecking=no \
+              -i ~/.ssh/CH3-key.pem \
+              ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
+              "echo 'SSH 연결 성공!'"; then
               exit 0
             fi
-            sleep 10
-            echo "SSH 연결 시도 중... ($i/30)"
+            sleep 15
           done
           echo "::error::SSH 연결 실패"
           exit 1
 
-      # === 9. Ansible 환경 설정 ===
-      - name: Install Ansible
+      # === 10. Ansible 설정 ===
+      - name: Setup Ansible Environment
         run: |
           sudo apt-get update
           sudo apt-get install -y ansible
 
-      # === 10. Ansible 인벤토리 생성 ===
-      - name: Generate Inventory
+      # === 11. Ansible 인벤토리 생성 ===
+      - name: Create Ansible Inventory
         run: |
           cat <<EOF > inventory.ini
           [ec2_instances]
-          target_server ansible_host=${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} ansible_user=ubuntu
+          ${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} ansible_user=ubuntu
             ansible_ssh_private_key_file=~/.ssh/CH3-key.pem
             ansible_python_interpreter=/usr/bin/python3
 
           [all:vars]
-          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
           EOF
 
-      # === 11. Ansible 플레이북 실행 ===
+      # === 12. Ansible 플레이북 실행 ===
       - name: Run Ansible Playbook
         run: |
-          cat <<EOF > playbook.yml
+          cat <<'EOF' > playbook.yml
           ---
-          - name: Basic EC2 Setup
+          - name: Configure EC2 Instance
             hosts: ec2_instances
             become: yes
             tasks:
@@ -125,25 +138,32 @@ jobs:
                 apt:
                   update_cache: yes
 
-              - name: Install essential packages
+              - name: Install base packages
                 apt:
                   name: ["vim", "curl", "git", "unzip", "python3-pip"]
                   state: present
 
-              - name: Ensure Python3 is available
-                raw: which python3 || (apt-get update && apt-get install -y python3)
+              - name: Verify Python
+                command: python3 --version
+                register: python_check
+                failed_when: false
+                changed_when: false
 
-              - name: Create marker file
+              - name: Debug Python Info
+                debug:
+                  var: python_check.stdout
+
+              - name: Create success marker
                 file:
-                  path: /tmp/github_actions_success
+                  path: /tmp/deployment_success
                   state: touch
-                  mode: '0644'
           EOF
 
-          ansible-playbook -i inventory.ini playbook.yml
+          ansible-playbook -i inventory.ini playbook.yml -vvv
 
-      # === 12. 실행 결과 확인 ===
-      - name: Verify Setup
+      # === 13. 결과 검증 ===
+      - name: Verify Deployment
         run: |
-          ssh -i ~/.ssh/CH3-key.pem ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
-            "ls -l /tmp/github_actions_success && echo 'Ansible 실행 성공!'"
+          ssh -i ~/.ssh/CH3-key.pem \
+            ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
+            "ls -la /tmp/deployment_success && echo '배포 성공!'"

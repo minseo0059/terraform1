@@ -30,6 +30,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # === 2. Terraform 설치 ===
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.6.6"  # 필수: 버전 명시
+
+      # === 3. AWS 인증 ===
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Create SSH Key File
         run: |
           mkdir -p ~/.ssh
@@ -50,20 +64,6 @@ jobs:
           terraform apply -auto-approve \
             -var="env=${{ github.event.inputs.env }}" \
             -var="key_name=${{ env.KEY_NAME }}"
-
-      # === 2. Terraform 설치 ===
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: "1.6.6"  # 필수: 버전 명시
-
-      # === 3. AWS 인증 ===
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
 
       # === 4. Terraform 실행 ===
       - name: Terraform Init

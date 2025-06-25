@@ -16,7 +16,7 @@ on:
 env:
   AWS_REGION: "ap-northeast-2"
   TF_STATE_BUCKET: "your-terraform-state-bucket"
-  ANSIBLE_SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}  # 저장소 Secrets에 등록된 SSH 키
+  KEY_NAME: "CH3-key"  # 저장소 Secrets에 등록된 SSH 키
 
 jobs:
   deploy:
@@ -29,6 +29,27 @@ jobs:
       # === 1. 초기 설정 ===
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Create SSH Key File
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/CH3-key.pem
+          chmod 600 ~/.ssh/CH3-key.pem
+          ssh-keygen -y -f ~/.ssh/CH3-key.pem > ~/.ssh/CH3-key.pub  # 공개키 생성
+
+      - name: Verify Key Pair
+        run: |
+          echo "Public Key:"
+          cat ~/.ssh/CH3-key.pub
+          echo -e "\nKey Fingerprint:"
+          ssh-keygen -lf ~/.ssh/CH3-key.pem
+
+      # Terraform Apply 시 키 이름 전달
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="env=${{ github.event.inputs.env }}" \
+            -var="key_name=${{ env.KEY_NAME }}"
 
       # === 2. Terraform 설치 ===
       - name: Setup Terraform

@@ -51,8 +51,7 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/CH3-key.pem
           chmod 600 ~/.ssh/CH3-key.pem
-          ssh-keygen -y -f ~/.ssh/CH3-key.pem > ~/.ssh/CH3-key.pub
-          echo "키 생성 완료. Fingerprint:"
+          echo "생성된 키 fingerprint:"
           ssh-keygen -lf ~/.ssh/CH3-key.pem
 
       # === 5. Terraform 초기화 ===
@@ -62,38 +61,52 @@ jobs:
             -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
             -backend-config="key=${{ github.event.inputs.env }}/terraform.tfstate"
 
-      # === 6. 인스턴스 생성 ===
+      # === 6. 인프라 배포 ===
       - name: Terraform Apply
         run: |
           terraform apply -auto-approve \
             -var="env=${{ github.event.inputs.env }}" \
             -var="key_name=${{ env.KEY_NAME }}"
 
-      # === 7. 인스턴스 상태 확인 ===
-      - name: Wait for Instance Ready
+      # === 7. 인스턴스 ID 추출 ===
+      - name: Get Instance ID
+        id: get_instance_id
+        run: |
+          INSTANCE_ID=$(terraform output -raw ec2_instance_id | tr -d '"' | tr -d '\n')
+          if [[ ! "$INSTANCE_ID" =~ ^i-[0-9a-f]{17}$ ]]; then
+            echo "::error::유효하지 않은 인스턴스 ID: $INSTANCE_ID"
+            exit 1
+          fi
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "확인된 인스턴스 ID: $INSTANCE_ID"
+
+      # === 8. 인스턴스 상태 대기 ===
+      - name: Wait Instance Ready
+        timeout-minutes: 3
         run: |
           aws ec2 wait instance-status-ok \
-            --instance-ids $(terraform output -raw ec2_instance_id) \
+            --instance-ids ${{ steps.get_instance_id.outputs.INSTANCE_ID }} \
             --region ${{ env.AWS_REGION }}
+          echo "인스턴스가 정상 상태입니다."
 
-      # === 8. IP 주소 획득 ===
-      - name: Get EC2 Public IP
+      # === 9. 공용 IP 추출 ===
+      - name: Get Public IP
         id: get_ip
         run: |
           IP=$(terraform output -raw ec2_public_ip | tr -d '"' | tr -d '\n')
           if [[ ! "$IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "::error::유효하지 않은 IP 주소 형식: $IP"
+            echo "::error::유효하지 않은 IP 주소: $IP"
             exit 1
           fi
           echo "EC2_PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
-          echo "확인된 IP: $IP"
+          echo "확인된 공용 IP: $IP"
 
-      # === 9. SSH 연결 테스트 ===
+      # === 10. SSH 연결 테스트 ===
       - name: Test SSH Connection
         timeout-minutes: 5
         run: |
-          for i in {1..20}; do
-            echo "SSH 연결 시도 ($i/20)..."
+          for i in {1..15}; do
+            echo "SSH 연결 시도 ($i/15)..."
             if ssh -o ConnectTimeout=10 \
               -o StrictHostKeyChecking=no \
               -i ~/.ssh/CH3-key.pem \
@@ -101,19 +114,19 @@ jobs:
               "echo 'SSH 연결 성공!'"; then
               exit 0
             fi
-            sleep 15
+            sleep 10
           done
-          echo "::error::SSH 연결 실패"
+          echo "::error::15회 시도 후 SSH 연결 실패"
           exit 1
 
-      # === 10. Ansible 설정 ===
-      - name: Setup Ansible Environment
+      # === 11. Ansible 환경 설정 ===
+      - name: Setup Ansible
         run: |
           sudo apt-get update
           sudo apt-get install -y ansible
 
-      # === 11. Ansible 인벤토리 생성 ===
-      - name: Create Ansible Inventory
+      # === 12. Ansible 인벤토리 생성 ===
+      - name: Create Inventory
         run: |
           cat <<EOF > inventory.ini
           [ec2_instances]
@@ -125,8 +138,8 @@ jobs:
           ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
           EOF
 
-      # === 12. Ansible 플레이북 실행 ===
-      - name: Run Ansible Playbook
+      # === 13. 플레이북 실행 ===
+      - name: Run Playbook
         run: |
           cat <<'EOF' > playbook.yml
           ---
@@ -134,36 +147,31 @@ jobs:
             hosts: ec2_instances
             become: yes
             tasks:
-              - name: Update apt cache
+              - name: Update packages
                 apt:
                   update_cache: yes
+                  cache_valid_time: 3600
 
-              - name: Install base packages
+              - name: Install essentials
                 apt:
-                  name: ["vim", "curl", "git", "unzip", "python3-pip"]
+                  name: [vim, curl, git, unzip, python3-pip]
                   state: present
 
               - name: Verify Python
                 command: python3 --version
-                register: python_check
-                failed_when: false
+                register: py_result
                 changed_when: false
 
-              - name: Debug Python Info
+              - name: Show Python Version
                 debug:
-                  var: python_check.stdout
-
-              - name: Create success marker
-                file:
-                  path: /tmp/deployment_success
-                  state: touch
+                  var: py_result.stdout
           EOF
 
-          ansible-playbook -i inventory.ini playbook.yml -vvv
+          ansible-playbook -i inventory.ini playbook.yml -v
 
-      # === 13. 결과 검증 ===
+      # === 14. 결과 확인 ===
       - name: Verify Deployment
         run: |
           ssh -i ~/.ssh/CH3-key.pem \
             ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
-            "ls -la /tmp/deployment_success && echo '배포 성공!'"
+            "python3 --version && echo '배포 성공!'"

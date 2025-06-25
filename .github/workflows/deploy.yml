@@ -16,7 +16,7 @@ on:
 env:
   AWS_REGION: "ap-northeast-2"
   TF_STATE_BUCKET: "your-terraform-state-bucket"
-  KEY_NAME: "CH3-key"
+  KEY_NAME: "CH3-key"  # 반드시 AWS 콘솔과 일치하는 키 이름
   ANSIBLE_SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
 
 jobs:
@@ -45,36 +45,71 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # === 4. SSH 키 설정 ===
+      # === 4. SSH 키 설정 (키 검증 추가) ===
       - name: Setup SSH Key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/CH3-key.pem
-          chmod 600 ~/.ssh/CH3-key.pem
-          echo "키 생성 완료. Fingerprint:"
-          ssh-keygen -lf ~/.ssh/CH3-key.pem
+          echo "${{ env.ANSIBLE_SSH_KEY }}" | tr -d '\r' > ~/.ssh/${KEY_NAME}.pem
+          chmod 600 ~/.ssh/${KEY_NAME}.pem
+          
+          # 키 유효성 검사
+          if ! ssh-keygen -lf ~/.ssh/${KEY_NAME}.pem; then
+            echo "::error::유효하지 않은 SSH 키 형식"
+            exit 1
+          fi
 
-      # === 5. Terraform 실행 ===
-      - name: Terraform Init & Apply
+      # === 5. 키 페어 존재 확인 ===
+      - name: Verify AWS Key Pair
         run: |
-          terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET }}"
-          terraform apply -auto-approve -var="env=${{ github.event.inputs.env }}"
+          aws ec2 describe-key-pairs \
+            --key-name "${{ env.KEY_NAME }}" \
+            --region ${{ env.AWS_REGION }} || {
+              echo "::error::키 페어 '${{ env.KEY_NAME }}'가 AWS에 존재하지 않음"
+              exit 1
+            }
 
-      # === 6. 인스턴스 IP 획득 ===
+      # === 6. Terraform 실행 ===
+      - name: Terraform Init
+        run: terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET }}"
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="env=${{ github.event.inputs.env }}" \
+            -var="key_name=${{ env.KEY_NAME }}"
+
+      # === 7. 인스턴스 IP 획득 ===
       - name: Get EC2 IP
         id: get_ip
         run: |
-          IP=$(terraform output -raw ec2_public_ip | tr -d '"')
+          IP=$(terraform output -raw ec2_public_ip | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
           echo "EC2_PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
           echo "확인된 IP: $IP"
 
-      # === 7. Ansible 설치 ===
+      # === 8. SSH 연결 테스트 ===
+      - name: Test SSH Connection
+        timeout-minutes: 5
+        run: |
+          for i in {1..10}; do
+            echo "SSH 연결 시도 ($i/10)..."
+            if ssh -o ConnectTimeout=15 \
+              -i ~/.ssh/${{ env.KEY_NAME }}.pem \
+              ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
+              "echo '연결 성공' && exit 0"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::SSH 연결 실패"
+          exit 1
+
+      # === 9. Ansible 설정 ===
       - name: Install Ansible
         run: |
           sudo apt-get update
           sudo apt-get install -y ansible
 
-      # === 8. Ansible 인벤토리 생성 ===
+      # === 10. Ansible 인벤토리 생성 ===
       - name: Create Inventory
         run: |
           cat <<EOF > inventory.ini
@@ -83,52 +118,36 @@ jobs:
 
           [all:vars]
           ansible_user=ubuntu
-          ansible_ssh_private_key_file=~/.ssh/CH3-key.pem
+          ansible_ssh_private_key_file=~/.ssh/${{ env.KEY_NAME }}.pem
           ansible_python_interpreter=/usr/bin/python3
-          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no -o ConnectTimeout=30'
           EOF
 
-      # === 9. Ansible 플레이북 실행 ===
-      - name: Run Ansible Playbook
+      # === 11. Ansible 플레이북 실행 ===
+      - name: Run Playbook
         run: |
           cat <<'EOF' > playbook.yml
           ---
-          - name: Configure EC2 Server
+          - name: Configure Server
             hosts: webserver
             become: yes
-
             tasks:
-              - name: Update apt cache
+              - name: Update packages
                 apt:
                   update_cache: yes
 
-              - name: Install essential packages
+              - name: Install essentials
                 apt:
-                  name:
-                    - nginx
-                    - docker.io
-                    - python3-pip
+                  name: [nginx, docker.io, python3-pip, git]
                   state: present
 
-              - name: Start Nginx service
+              - name: Start Nginx
                 service:
                   name: nginx
                   state: started
                   enabled: yes
 
-              - name: Create deployment user
-                user:
-                  name: deployer
-                  groups: sudo
-                  append: yes
-                  shell: /bin/bash
-
-              - name: Add SSH key for deployer
-                authorized_key:
-                  user: deployer
-                  key: "${{ secrets.DEPLOYER_SSH_KEY }}"
-
-              - name: Ensure Docker group exists
+              - name: Add Docker group
                 group:
                   name: docker
                   state: present
@@ -140,18 +159,20 @@ jobs:
                   append: yes
                 loop:
                   - ubuntu
-                  - deployer
+                  - root
 
               - name: Create success marker
                 file:
                   path: /tmp/deployment_success
                   state: touch
+                  mode: 0644
           EOF
 
-          ansible-playbook -i inventory.ini playbook.yml -vvv
+          ansible-playbook -i inventory.ini playbook.yml -v
 
-      # === 10. 결과 검증 ===
+      # === 12. 결과 검증 ===
       - name: Verify Deployment
         run: |
-          ssh -i ~/.ssh/CH3-key.pem ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
-            "curl -s localhost && echo '' && docker --version"
+          ssh -i ~/.ssh/${{ env.KEY_NAME }}.pem \
+            ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
+            "ls -l /tmp/deployment_success && docker --version && nginx -v"

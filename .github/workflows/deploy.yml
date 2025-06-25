@@ -16,7 +16,8 @@ on:
 env:
   AWS_REGION: "ap-northeast-2"
   TF_STATE_BUCKET: "your-terraform-state-bucket"
-  KEY_NAME: "CH3-key"  # 저장소 Secrets에 등록된 SSH 키
+  KEY_NAME: "CH3-key"
+  ANSIBLE_SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}  # SSH 키 통일
 
 jobs:
   deploy:
@@ -34,7 +35,7 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: "1.6.6"  # 필수: 버전 명시
+          terraform_version: "1.6.6"
 
       # === 3. AWS 인증 ===
       - name: Configure AWS Credentials
@@ -44,38 +45,29 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # === 4. SSH 키 설정 ===
       - name: Create SSH Key File
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/CH3-key.pem
+          echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/CH3-key.pem
           chmod 600 ~/.ssh/CH3-key.pem
-          ssh-keygen -y -f ~/.ssh/CH3-key.pem > ~/.ssh/CH3-key.pub  # 공개키 생성
+          ssh-keygen -y -f ~/.ssh/CH3-key.pem > ~/.ssh/CH3-key.pub
 
-      - name: Verify Key Pair
-        run: |
-          echo "Public Key:"
-          cat ~/.ssh/CH3-key.pub
-          echo -e "\nKey Fingerprint:"
-          ssh-keygen -lf ~/.ssh/CH3-key.pem
-
-      # Terraform Apply 시 키 이름 전달
-      - name: Terraform Apply
-        run: |
-          terraform apply -auto-approve \
-            -var="env=${{ github.event.inputs.env }}" \
-            -var="key_name=${{ env.KEY_NAME }}"
-
-      # === 4. Terraform 실행 ===
+      # === 5. Terraform 초기화 ===
       - name: Terraform Init
         run: |
           terraform init \
             -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
             -backend-config="key=${{ github.event.inputs.env }}/terraform.tfstate"
 
+      # === 6. Terraform 적용 ===
       - name: Terraform Apply
-        run: terraform apply -auto-approve -var="env=${{ github.event.inputs.env }}"
+        run: |
+          terraform apply -auto-approve \
+            -var="env=${{ github.event.inputs.env }}" \
+            -var="key_name=${{ env.KEY_NAME }}"
 
-      # === 5. EC2 IP 획득 ===
+      # === 7. EC2 IP 획득 ===
       - name: Get EC2 Public IP
         id: get_ip
         run: |
@@ -83,7 +75,7 @@ jobs:
           echo "EC2_PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
           echo "::notice::EC2 Public IP: $IP"
 
-      # === 6. SSH 연결 대기 ===
+      # === 8. SSH 연결 대기 ===
       - name: Wait for SSH
         run: |
           for i in {1..30}; do
@@ -97,35 +89,26 @@ jobs:
           echo "::error::SSH 연결 실패"
           exit 1
 
-      # === 7. Ansible 환경 설정 ===
+      # === 9. Ansible 환경 설정 ===
       - name: Install Ansible
         run: |
           sudo apt-get update
           sudo apt-get install -y ansible
 
-      - name: Create SSH Key File
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/ec2_key
-          chmod 600 ~/.ssh/ec2_key
-
-      # === 8. Ansible 인벤토리 생성 ===
+      # === 10. Ansible 인벤토리 생성 ===
       - name: Generate Inventory
         run: |
           cat <<EOF > inventory.ini
           [ec2_instances]
           target_server ansible_host=${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} ansible_user=ubuntu
-            ansible_ssh_private_key_file=~/.ssh/ec2_key
+            ansible_ssh_private_key_file=~/.ssh/CH3-key.pem
             ansible_python_interpreter=/usr/bin/python3
 
           [all:vars]
           ansible_ssh_common_args='-o StrictHostKeyChecking=no'
           EOF
 
-          echo "생성된 인벤토리 내용:"
-          cat inventory.ini
-
-      # === 9. Ansible 플레이북 실행 ===
+      # === 11. Ansible 플레이북 실행 ===
       - name: Run Ansible Playbook
         run: |
           cat <<EOF > playbook.yml
@@ -155,8 +138,8 @@ jobs:
 
           ansible-playbook -i inventory.ini playbook.yml
 
-      # === 10. 실행 결과 확인 ===
+      # === 12. 실행 결과 확인 ===
       - name: Verify Setup
         run: |
-          ssh -i ~/.ssh/ec2_key ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
+          ssh -i ~/.ssh/CH3-key.pem ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
             "ls -l /tmp/github_actions_success && echo 'Ansible 실행 성공!'"

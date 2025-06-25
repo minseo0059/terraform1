@@ -62,9 +62,11 @@ jobs:
       # === 6. 인프라 배포 ===
       - name: Terraform Apply
         run: |
+          # create_vpc=false시 기존 VPC 사용
           terraform apply -auto-approve \
             -var="env=${{ github.event.inputs.env }}" \
             -var="key_name=${{ env.KEY_NAME }}" \
-            -var="create_vpc=false"  # 기존 VPC 사용
+            -var="create_vpc=false" \
+            -var="existing_vpc_id=vpc-12345678"  # 실제 기존 VPC ID로 교체
 
       # ... (이후 단계는 동일) ...

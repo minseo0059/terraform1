@@ -51,22 +51,107 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/CH3-key.pem
           chmod 600 ~/.ssh/CH3-key.pem
+          echo "키 생성 완료. Fingerprint:"
+          ssh-keygen -lf ~/.ssh/CH3-key.pem
 
-      # === 5. Terraform 초기화 ===
-      - name: Terraform Init
+      # === 5. Terraform 실행 ===
+      - name: Terraform Init & Apply
         run: |
-          terraform init \
-            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ github.event.inputs.env }}/terraform.tfstate"
+          terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET }}"
+          terraform apply -auto-approve -var="env=${{ github.event.inputs.env }}"
 
-      # === 6. 인프라 배포 ===
-      - name: Terraform Apply
+      # === 6. 인스턴스 IP 획득 ===
+      - name: Get EC2 IP
+        id: get_ip
         run: |
-          # create_vpc=false시 기존 VPC 사용
-          terraform apply -auto-approve \
-            -var="env=${{ github.event.inputs.env }}" \
-            -var="key_name=${{ env.KEY_NAME }}" \
-            -var="create_vpc=false" \
-            -var="existing_vpc_id=vpc-12345678"  # 실제 기존 VPC ID로 교체
+          IP=$(terraform output -raw ec2_public_ip | tr -d '"')
+          echo "EC2_PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+          echo "확인된 IP: $IP"
 
-      # ... (이후 단계는 동일) ...
+      # === 7. Ansible 설치 ===
+      - name: Install Ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible
+
+      # === 8. Ansible 인벤토리 생성 ===
+      - name: Create Inventory
+        run: |
+          cat <<EOF > inventory.ini
+          [webserver]
+          ${{ steps.get_ip.outputs.EC2_PUBLIC_IP }}
+
+          [all:vars]
+          ansible_user=ubuntu
+          ansible_ssh_private_key_file=~/.ssh/CH3-key.pem
+          ansible_python_interpreter=/usr/bin/python3
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+
+      # === 9. Ansible 플레이북 실행 ===
+      - name: Run Ansible Playbook
+        run: |
+          cat <<'EOF' > playbook.yml
+          ---
+          - name: Configure EC2 Server
+            hosts: webserver
+            become: yes
+
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+
+              - name: Install essential packages
+                apt:
+                  name:
+                    - nginx
+                    - docker.io
+                    - python3-pip
+                  state: present
+
+              - name: Start Nginx service
+                service:
+                  name: nginx
+                  state: started
+                  enabled: yes
+
+              - name: Create deployment user
+                user:
+                  name: deployer
+                  groups: sudo
+                  append: yes
+                  shell: /bin/bash
+
+              - name: Add SSH key for deployer
+                authorized_key:
+                  user: deployer
+                  key: "${{ secrets.DEPLOYER_SSH_KEY }}"
+
+              - name: Ensure Docker group exists
+                group:
+                  name: docker
+                  state: present
+
+              - name: Add users to Docker group
+                user:
+                  name: "{{ item }}"
+                  groups: docker
+                  append: yes
+                loop:
+                  - ubuntu
+                  - deployer
+
+              - name: Create success marker
+                file:
+                  path: /tmp/deployment_success
+                  state: touch
+          EOF
+
+          ansible-playbook -i inventory.ini playbook.yml -vvv
+
+      # === 10. 결과 검증 ===
+      - name: Verify Deployment
+        run: |
+          ssh -i ~/.ssh/CH3-key.pem ubuntu@${{ steps.get_ip.outputs.EC2_PUBLIC_IP }} \
+            "curl -s localhost && echo '' && docker --version"

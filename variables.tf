@@ -30,16 +30,3 @@ variable "instance_type" {
   type        = string
   default     = "t2.micro"  # 기본값 설정 (필요시 덮어쓰기 가능)
 }
-# variables.tf (루트 디렉토리에 생성)
-
-variable "create_vpc" {
-  description = "Controls if VPC should be created"
-  type        = bool
-  default     = true  # 기본값으로 새 VPC 생성
-}
-
-variable "existing_vpc_id" {
-  description = "Existing VPC ID when create_vpc is false"
-  type        = string
-  default     = ""
-}

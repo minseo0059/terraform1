@@ -51,7 +51,7 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ env.ANSIBLE_SSH_KEY }}" > ~/.ssh/CH3-key.pem
           chmod 600 ~/.ssh/CH3-key.pem
-          echo "생성된 키 fingerprint:"
+          echo "키 생성 완료. Fingerprint:"
           ssh-keygen -lf ~/.ssh/CH3-key.pem
 
       # === 5. Terraform 초기화 ===
@@ -68,38 +68,45 @@ jobs:
             -var="env=${{ github.event.inputs.env }}" \
             -var="key_name=${{ env.KEY_NAME }}"
 
-      # === 7. 인스턴스 ID 추출 ===
+      # === 7. 인스턴스 ID 추출 (강화된 버전) ===
       - name: Get Instance ID
         id: get_instance_id
         run: |
-          INSTANCE_ID=$(terraform output -raw ec2_instance_id | tr -d '"' | tr -d '\n')
-          if [[ ! "$INSTANCE_ID" =~ ^i-[0-9a-f]{17}$ ]]; then
-            echo "::error::유효하지 않은 인스턴스 ID: $INSTANCE_ID"
+          # 3단계 필터링: raw 출력 → grep으로 ID 추출 → 첫 번째 결과 선택
+          RAW_OUTPUT=$(terraform output -raw ec2_instance_id)
+          INSTANCE_ID=$(echo "$RAW_OUTPUT" | grep -oE 'i-[a-f0-9]{17}' | head -1)
+          
+          if [[ -z "$INSTANCE_ID" || ! "$INSTANCE_ID" =~ ^i-[0-9a-f]{17}$ ]]; then
+            echo "::error::유효하지 않은 인스턴스 ID. 원본 출력: $RAW_OUTPUT"
             exit 1
           fi
-          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          echo "확인된 인스턴스 ID: $INSTANCE_ID"
+          
+          echo "INSTANCE_ID=${INSTANCE_ID}" >> $GITHUB_OUTPUT
+          echo "확인된 인스턴스 ID: ${INSTANCE_ID}"
 
       # === 8. 인스턴스 상태 대기 ===
       - name: Wait Instance Ready
         timeout-minutes: 3
         run: |
+          echo "인스턴스 상태 확인 시작 (ID: ${{ steps.get_instance_id.outputs.INSTANCE_ID }})"
           aws ec2 wait instance-status-ok \
             --instance-ids ${{ steps.get_instance_id.outputs.INSTANCE_ID }} \
-            --region ${{ env.AWS_REGION }}
+            --region ${{ env.AWS_REGION }} \
+            --output text
           echo "인스턴스가 정상 상태입니다."
 
       # === 9. 공용 IP 추출 ===
       - name: Get Public IP
         id: get_ip
         run: |
-          IP=$(terraform output -raw ec2_public_ip | tr -d '"' | tr -d '\n')
-          if [[ ! "$IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "::error::유효하지 않은 IP 주소: $IP"
+          IP=$(terraform output -raw ec2_public_ip | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+          if [[ -z "$IP" ]]; then
+            echo "::error::IP 주소 추출 실패. 원본 출력:"
+            terraform output ec2_public_ip
             exit 1
           fi
-          echo "EC2_PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
-          echo "확인된 공용 IP: $IP"
+          echo "EC2_PUBLIC_IP=${IP}" >> $GITHUB_OUTPUT
+          echo "확인된 공용 IP: ${IP}"
 
       # === 10. SSH 연결 테스트 ===
       - name: Test SSH Connection
